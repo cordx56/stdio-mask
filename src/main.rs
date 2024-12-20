@@ -130,11 +130,73 @@ extern "C" fn resize_window(_: c_int) {
     }
 }
 
+fn clear(mut w: impl Write) {
+    w.write(&[0x1b]).unwrap();
+    w.write("[1;1H".as_bytes()).unwrap();
+    w.write(&[0x1b]).unwrap();
+    w.write("[0J".as_bytes()).unwrap();
+}
+fn save_cursor_pos(mut w: impl Write) {
+    w.write(&[0x1b, '7' as u8]).unwrap();
+}
+fn restore_cursor_pos(mut w: impl Write) {
+    w.write(&[0x1b, '8' as u8]).unwrap();
+}
+fn mv_cursor(mut w: impl Write, row: usize, col: usize) {
+    w.write(&[0x1b]).unwrap();
+    w.write(format!("[{};{}H", row, col).as_bytes()).unwrap();
+}
+fn replace(mut w: impl Write, left: i32, ch: char) {
+    w.write(&[0x1b]).unwrap();
+    w.write(format!("[{}D", left).as_bytes()).unwrap();
+    for _ in 0..left {
+        w.write(&[ch as u8]).unwrap();
+    }
+}
+fn alter(mut w: impl Write) {
+    w.write(&[0x1b]).unwrap();
+    w.write(b"[?1049h").unwrap();
+}
+fn noalter(mut w: impl Write) {
+    w.write(&[0x1b]).unwrap();
+    w.write(b"[?1049l").unwrap();
+}
+fn get_cursor_pos(mut r: impl Read, mut w: impl Write) -> (usize, usize, Vec<u8>) {
+    let mut row = 0;
+    w.write(&[0x1b]).unwrap();
+    w.write("[6n".as_bytes()).unwrap();
+    w.flush().unwrap();
+    let mut buf = Vec::new();
+    let mut return_buf = Vec::new();
+    r.read_exact(&mut [0]).unwrap();
+    loop {
+        let mut b = [0; 1];
+        r.read_exact(&mut b).unwrap();
+        let c = b[0];
+        if c == ';' as u8 {
+            for i in (buf.len() - 1..=0).rev() {
+                if buf[i] == '[' as u8 {
+                    return_buf = buf[0..i - 1].to_vec();
+                    row = String::from_utf8_lossy(&buf[i + 1..]).parse().unwrap();
+                }
+            }
+            buf = Vec::new();
+        } else if c == 'R' as u8 {
+            let col = String::from_utf8_lossy(&buf).parse().unwrap();
+            return (row, col, return_buf);
+        } else {
+            buf.push(c);
+        }
+    }
+}
+
 fn main() {
+    /*
     let config = fs::read_to_string(".maskrc.toml").unwrap();
     let config: Config = toml::from_str(&config).unwrap();
     let check_list = config.check.text.clone();
     let mask = config.mask.char.clone();
+    */
 
     let mut a = env::args();
     a.next();
@@ -188,15 +250,63 @@ fn main() {
             let master = File::from(master);
 
             // read child's output and output to stdout
-            let file = master.try_clone().unwrap();
-            thread::spawn(|| {
+            let mut file = master.try_clone().unwrap();
+            let mut log = fs::File::create_new("log.txt").unwrap();
+            thread::spawn(move || {
                 let mut stdout = io::stdout();
-                let mut buf = CheckBuf::new(check_list, mask);
-                for byte in file.bytes() {
-                    let byte = byte.unwrap();
+                //let mut buf = CheckBuf::new(check_list, mask);
+                let mut buffer = Vec::new();
+
+                clear(&stdout);
+                stdout.flush().unwrap();
+                let rewrite = "yuk".as_bytes();
+                let mut byte = [0];
+                while file.read_exact(&mut byte).is_ok() {
+                    let byte = byte[0];
+                    buffer.push(byte);
+
+                    alter(&stdout);
+                    mv_cursor(&stdout, 1, 1);
+                    stdout.flush().unwrap();
+                    let mut screen = vec![vec![0; 2048]; 2048];
+                    let mut rest = Vec::new();
+                    for i in 0..buffer.len() {
+                        let b = buffer[i];
+                        write!(log, "{:?}", String::from_utf8_lossy(&buffer));
+                        let (row, col, buf) = get_cursor_pos(&file, &stdout);
+                        //println!("{};{}", row, col);
+                        rest = buf;
+                        write!(
+                            log,
+                            "{}:{}:{:?}",
+                            row,
+                            col,
+                            String::from_utf8_lossy(&buffer)
+                        );
+                        screen[row][col] = b;
+                        stdout.write_all(&[b]).unwrap();
+                        stdout.flush().unwrap();
+                    }
+                    buffer.extend_from_slice(&rest);
+                    noalter(&stdout);
+                    stdout.flush().unwrap();
+
+                    // save screen
+                    //stdout.write_all(&[0x1b]).unwrap();
+                    //stdout.write_all("[?47h".as_bytes()).unwrap();
+
+                    //stdout.write_all(&buffer).unwrap();
+
+                    // restore screen
+                    //stdout.write_all(&[0x1b]).unwrap();
+                    //stdout.write_all("[?47l".as_bytes()).unwrap();
+
+                    //stdout.flush().unwrap();
+                    /*
                     let out = buf.output(byte);
                     stdout.write_all(&out).unwrap();
                     stdout.flush().unwrap();
+                    */
                 }
             });
 
