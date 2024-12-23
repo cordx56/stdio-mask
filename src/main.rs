@@ -21,7 +21,16 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
+use std::sync::mpsc;
 use std::thread;
+
+use termwiz::{
+    caps::Capabilities,
+    cell::{Cell, CellAttributes},
+    escape::{parser::Parser, Action},
+    surface,
+    terminal::{self, buffered::BufferedTerminal, Terminal, UnixTerminal},
+};
 
 #[derive(Deserialize)]
 struct Check {
@@ -190,6 +199,112 @@ fn get_cursor_pos(mut r: impl Read, mut w: impl Write) -> (usize, usize, Vec<u8>
     }
 }
 
+pub struct VirtualScreen {
+    //term: BufferedTerminal<T>,
+    actions: Vec<Action>,
+    //chars: Vec<Vec<Option<(usize, char)>>>,
+}
+impl VirtualScreen {
+    pub fn new() -> VirtualScreen {
+        let actions = Vec::new();
+        VirtualScreen { actions }
+    }
+    fn input(&mut self, bytes: &[u8]) -> String {
+        let mut term = UnixTerminal::new(Capabilities::new_from_env().unwrap()).unwrap();
+        term.set_raw_mode().unwrap();
+        let mut term = BufferedTerminal::new(term).unwrap();
+        let (w, h) = term.dimensions();
+        let mut chars = vec![vec![None; w + 1]; h + 1];
+
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        for action in parser.parse_as_vec(bytes) {
+            match action {
+                Action::PrintString(s) => {
+                    let chars: Vec<_> = s.chars().into_iter().map(|c| Action::Print(c)).collect();
+                    actions.extend_from_slice(&chars);
+                }
+                _ => {
+                    actions.push(action);
+                }
+            }
+        }
+
+        self.actions.extend_from_slice(&actions);
+        for (i, action) in self.actions.iter().enumerate() {
+            match action {
+                Action::Print(c) => {
+                    let (x, y) = term.cursor_position();
+                    chars[y][x] = Some((i, *c));
+                }
+                _ => {}
+            }
+            term.add_change(format!("{}", action));
+            term.flush().unwrap();
+        }
+        for rowi in 0..chars.len() {
+            let mut indices = Vec::new();
+            let mut s = String::new();
+            for coli in 0..chars[rowi].len() {
+                if let Some((i, c)) = &chars[rowi][coli] {
+                    indices.push(*i);
+                    s.push(*c);
+                    if s == "ma21029" {
+                        for i in &indices {
+                            self.actions[*i] = Action::Print('x');
+                        }
+                        s = String::new();
+                    }
+                } else {
+                    indices = Vec::new();
+                    s = String::new();
+                }
+            }
+        }
+        self.actions
+            .iter()
+            .map(|v| format!("{}", v))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+fn check_actions(actions: &[Action], check: &str) -> Vec<Action> {
+    let mut res = Vec::new();
+    for i in 0..actions.len() {
+        match &actions[i] {
+            Action::PrintString(s) => {
+                for c in s.chars() {
+                    res.push(Action::Print(c));
+                }
+            }
+            _ => {
+                res.push(actions[i].clone());
+            }
+        }
+    }
+    let mut checked = Vec::new();
+    for i in 0..res.len() {
+        match &res[i] {
+            Action::Print(c) => {
+                if let Some(checkch) = check.chars().nth(checked.len()) {
+                    if *c == checkch {
+                        checked.push(i);
+                    } else {
+                        checked = Vec::new();
+                    }
+                } else {
+                    for i in &checked {
+                        res[*i] = Action::Print('x');
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    res
+}
+
 fn main() {
     /*
     let config = fs::read_to_string(".maskrc.toml").unwrap();
@@ -236,7 +351,7 @@ fn main() {
             attr.output_flags &= !(OutputFlags::OPOST);
             attr.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
             attr.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
-            tcsetattr(&stdin, SetArg::TCSAFLUSH, &attr).unwrap();
+            //tcsetattr(&stdin, SetArg::TCSAFLUSH, &attr).unwrap();
 
             // change signal actions
             // set global child pid to hook signal
@@ -246,17 +361,120 @@ fn main() {
                 signal(Signal::SIGWINCH, SigHandler::Handler(resize_window)).unwrap();
             }
 
+            //let (tx, rx) = mpsc::channel();
+
             // open pty master as File
             let master = File::from(master);
 
             // read child's output and output to stdout
             let mut file = master.try_clone().unwrap();
-            let mut log = fs::File::create_new("log.txt").unwrap();
+            //let mut log = fs::File::create_new("log.txt").unwrap();
             thread::spawn(move || {
                 let mut stdout = io::stdout();
                 //let mut buf = CheckBuf::new(check_list, mask);
-                let mut buffer = Vec::new();
+                //let mut buffer = Vec::new();
+                let mut display =
+                    terminal::new_terminal(Capabilities::new_from_env().unwrap()).unwrap();
+                let size = display.get_screen_size().unwrap();
+                let mut surf = surface::Surface::new(size.cols, size.rows);
+                /*
+                let mut bufterm = terminal::UnixTerminal::new_with(
+                    Capabilities::new_from_env().unwrap(),
+                    &io::stdin().as_raw_fd(),
+                    &file.as_raw_fd(),
+                )
+                .unwrap();
+                bufterm.set_raw_mode().unwrap();
+                //terminal::new_terminal(Capabilities::new_from_env().unwrap()).unwrap()
+                let mut bufterm = terminal::buffered::BufferedTerminal::new(bufterm).unwrap();
+                */
+                /*
+                let mut term = terminal::UnixTerminal::new_with(
+                    Capabilities::new_from_env().unwrap(),
+                    &file.as_raw_fd(),
+                    &io::stdout(),
+                )
+                .unwrap();
+                */
+                let mut term =
+                    terminal::new_terminal(Capabilities::new_from_env().unwrap()).unwrap();
+                term.set_raw_mode().unwrap();
+                let mut term = terminal::buffered::BufferedTerminal::new(term).unwrap();
+                let (w, h) = term.dimensions();
+                let mut bufterm =
+                    terminal::new_terminal(Capabilities::new_from_env().unwrap()).unwrap();
+                let mut bufterm = terminal::buffered::BufferedTerminal::new(bufterm).unwrap();
+                let mut parser = Parser::new();
+                loop {
+                    //bufterm.flush().unwrap();
+                    /*k
+                    for cells in bufterm.screen_cells().into_iter() {
+                        for cell in cells {
+                            //println!("{cell:?}");
+                            if let Some(pos) = cell.str().find("y") {
+                                let new = Cell::new('x', cell.attrs().clone());
+                                *cell = new;
+                            }
+                        }
+                    }
+                    */
+                    //let seq = term.draw_from_screen(&bufterm, 0, 0);
+                    let mut all_buffer = String::new();
+                    let mut buf = vec![0; 4096];
+                    let mut virt = VirtualScreen::new();
+                    if let Ok(len) = file.read(&mut buf) {
+                        if len == 0 {
+                            break;
+                        }
+                        //let actions = check_actions(&parser.parse_as_vec(&buf[0..len]), "ma21029");
 
+                        /*
+                        let actions = &parser.parse_as_vec(&buf[0..len]);
+                        let changes = actions
+                            .into_iter()
+                            .map(|v| format!("{}", v))
+                            .collect::<Vec<String>>()
+                            .join("");
+                        //all_buffer.push_str(&String::from_utf8_lossy(&buf[0..len]));
+                        all_buffer.push_str(&changes);
+                        bufterm.add_change(&changes);
+                        let cells = bufterm.screen_cells();
+                        for line in cells {
+                            for cell in line {
+                                let new_str = parser.parse_as_vec(
+                                    cell.str().replace("ma21029", "xxxxxxx").as_bytes(),
+                                );
+                                *cell = Cell::new_grapheme(&new_str, cell.attrs().clone(), None);
+                            }
+                        }
+                        */
+
+                        let actions = virt.input(&buf[0..len]);
+
+                        let bufterm =
+                            terminal::new_terminal(Capabilities::new_from_env().unwrap()).unwrap();
+                        let mut bufterm = BufferedTerminal::new(bufterm).unwrap();
+                        bufterm.add_change(&actions);
+
+                        //bufsurf.add_change(&all_buffer);
+                        //let changes = term.diff_screens(&bufsurf);
+                        //term.add_change(&all_buffer);
+                        term.draw_from_screen(&bufterm, 0, 0);
+                        term.flush().unwrap();
+                    } else {
+                        break;
+                    }
+                    //term.flush().unwrap();
+                }
+                /*
+                for byte in file.bytes() {
+                    let byte = byte.unwrap();
+                    bufterm.add_change(byte as char);
+                    display.render(&bufterm.get_changes(0).1);
+                }
+                */
+
+                /*
                 clear(&stdout);
                 stdout.flush().unwrap();
                 let rewrite = "yuk".as_bytes();
@@ -308,9 +526,11 @@ fn main() {
                     stdout.flush().unwrap();
                     */
                 }
+                */
             });
 
             // read from stdin and send to child's stdin
+            /*
             let mut file = master.try_clone().unwrap();
             thread::spawn(move || {
                 let stdin = io::stdin();
@@ -319,6 +539,36 @@ fn main() {
                     file.write_all(&[byte]).unwrap();
                     file.flush().unwrap();
                 }
+            });
+            */
+            let mut file = master.try_clone().unwrap();
+            thread::spawn(move || {
+                let mut stdin = io::stdin();
+                for byte in stdin.bytes() {
+                    let byte = byte.unwrap();
+                    file.write(&[byte]).unwrap();
+                    file.flush().unwrap();
+                }
+                /*
+                loop {
+                    if let Ok(len) = stdin.read(&mut buf) {
+                        if len == 0 {
+                            break;
+                        }
+                        let actions = parser.parse_as_vec(&buf[0..len]);
+                        tx.send(
+                            actions
+                                .into_iter()
+                                .map(|v| format!("{}", v))
+                                .collect::<Vec<String>>()
+                                .join("\n"),
+                        )
+                        .unwrap();
+                    } else {
+                        break;
+                    }
+                }
+                */
             });
 
             // wait child process exit

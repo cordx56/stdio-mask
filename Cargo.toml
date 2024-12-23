@@ -7,4 +7,5 @@ edition = "2021"
 libc = "0.2.158"
 nix = { version = "0.29.0", features = ["term", "process", "ioctl", "fs", "signal"] }
 serde = { version = "1.0.208", features = ["derive"] }
+termwiz = "0.22.0"
 toml = "0.8.19"
